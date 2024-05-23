@@ -1,0 +1,812 @@
+
+#!/usr/bin/env groovy
+import sun.font.Script
+ 
+// https://stash.gto.intranet.db.com:8081/projects/RAD/repos/jenkins-shared-libraries/browse
+@Library('rad-jenkins-libs@helmfix') _
+ 
+def ENV_FROM_PROMOTION
+def ENV_PROMOTION_TO
+def ENV_PROMOTION_PATH
+def SECRET_PREFIX
+def PROMOTION_FOLDER
+def TARGET_ENV
+def ENV_PACKAGE_NAME
+def ENV_PROMOTION_TO_NAMESPACE
+ 
+pipeline {
+    agent {
+        kubernetes {
+            cloud 'openshift'
+            label "build-${env.BUILD_ID}"
+            yamlFile "MvnBuildPod.yaml"
+            defaultContainer 'jnlp'
+        }
+    }
+environment {
+ 
+		GLOBAL_REGISTRY = "docker-registry.svc.uk.paas.intranet.db.com"
+        ARTIFACTORY_SECRET = "artifactory-credentials"
+        CLUSTER_ROOT = "uki1f.paas.intranet.db.com"
+        INT_CLUSTER = "console-${CLUSTER_ROOT}"
+        INT_CLUSTER_URL = "https://${env.INT_CLUSTER}"
+        INT_OC_NAMESPACE = "dk2199-a"
+        INT_OC_TOKEN_SECRET = "${env.INT_OC_NAMESPACE}-sa-edit-token-text"
+        GIT_SECRET = "${env.INT_OC_NAMESPACE}-scmsecret"
+        HELM_VIRTUAL_URL = "https://artifactory.intranet.db.com/artifactory/hlm-all"
+        HELM_NAMESPACE = "com/db/npms"
+        BRANCHES_TO_LEAVE_DEPLOYED_PATTERN = 'development'
+		BASE_IMAGE = "${params.BASE_IMAGE}"
+		IMAGE_NAME = "person-fetch-service"
+		IMAGE_TAG = "1.0.${env.BUILD_ID}"
+		MVN_SETTINGS = "maven-settings-digitalid"
+		HELM_ACTION = "upgrade"
+		HELM_ARGS = "-i person-fetch-service"
+		SRC_BUILD = ""
+		GROUP_ID = "com.db.digitalid"
+		ARTIFACT_ID = "person-fetch-service"
+		VERSION = "${env.IMAGE_TAG}"
+		SNAPSHOT_VERSION = ""
+		BLANK = ""
+		RELEASE = "${env.RELEASE}"
+		MVN_REPO_NAME = "mvn-public-local"
+		DAP_SECRET = "dap_key"
+		LT_DAP_SECRET = "lt_dap_key"
+		PROMOTION_PATH = "int-uat"
+		OC_PROJECT = "dk2199"
+	}
+ 
+    stages {
+ 
+        stage("Agenda") {
+			options {
+				timeout(time: 2, unit: 'MINUTES')
+			}
+ 
+			steps {
+				script {
+					try {
+					    env.BRANCH_NAME="master";
+						def USER_INPUT = input(
+							message: 'Get Release parameters', parameters: [
+							choice(name: 'environmentFrom', choices: ['INT', 'UAT'], description: 'Select environment from promotion to be initiated'),
+							choice(name: 'environmentTo', choices: ['NONE', 'UAT', 'LT'], description: 'Select environment where to promote'),
+						]);
+ 
+						echo "User Input ${USER_INPUT.environmentFrom}";
+						echo "User Input ${USER_INPUT.environmentTo}";
+						echo "Service is ${IMAGE_NAME}";
+ 
+						if (USER_INPUT.environmentFrom.equals("INT")) {
+							ENV_FROM_PROMOTION = "int";
+						}
+ 
+						if (USER_INPUT.environmentFrom.equals("UAT")) {
+							ENV_FROM_PROMOTION = "uat";
+						}
+ 
+						if (USER_INPUT.environmentTo.equals("UAT")) {
+							ENV_PROMOTION_TO = "uat";
+							SECRET_PREFIX = "uat";
+							ENV_PROMOTION_TO_NAMESPACE = "--namespace dk2042-b";
+						}
+ 
+						if (USER_INPUT.environmentTo.equals("LT")) {
+							ENV_PROMOTION_TO = "ltuat";
+							SECRET_PREFIX = "uat";
+							ENV_PROMOTION_TO_NAMESPACE = "--namespace dk2042-c";
+						}
+ 
+						if (USER_INPUT.environmentTo.equals("PROD")) {
+							ENV_PROMOTION_TO = "prod";
+							SECRET_PREFIX = "prod";
+							ENV_PROMOTION_TO_NAMESPACE = "--namespace dk2042-d";
+						}
+ 
+						if (USER_INPUT.environmentTo.equals("NONE")) {
+							ENV_PROMOTION_TO = "none";
+							SECRET_PREFIX = "none";
+							ENV_PROMOTION_TO_NAMESPACE = "none";
+						}
+ 
+						if (isIntegrationBranch() && !ENV_PROMOTION_TO.equals("none")) {
+							echo "Promotion Flag : true";
+						} else {
+							echo "Promotion Flag : false";
+						}
+					}
+ 
+					catch (Throwable e) {
+						echo "Caught ${e.toString()}"
+                        ENV_FROM_PROMOTION = "int2";
+                        ENV_PROMOTION_TO = "none";
+                        SECRET_PREFIX = "none";
+                        ENV_PROMOTION_TO_NAMESPACE = "none";
+ 
+                        if(isPromotionBranch()) {
+                            try {
+                                if(params.environmentTo.equals("LT")) {
+                                    ENV_PROMOTION_TO = "ltuat";
+                                    SECRET_PREFIX = "uat";
+                                    ENV_PROMOTION_TO_NAMESPACE = "--namespace dk2042-c";
+                                }
+ 
+                                if(params.environmentTo.equals("PS")) {
+                                    ENV_PROMOTION_TO = "uatps1";
+                                    SECRET_PREFIX = "uat";
+                                    ENV_PROMOTION_TO_NAMESPACE = "--namespace dk2042-f";
+                                }
+                                echo "Parameters are assigned by upstream job..."
+                            }
+                            catch(Throwable e1) {
+                                echo "Caught ${e1.toString()}"
+                                echo "Parameters are not assigned by upstream job..."
+                            }
+                        }
+					}
+				}
+			}
+		}
+ 
+		stage("Development Env") {
+			when {
+				expression {
+					isDevelopmentBranch()
+				}
+			}
+ 
+			steps {
+				script {
+					env.IMAGE_TAG = generateDevVersion();
+					env.VERSION = env.IMAGE_TAG;
+					env.PACKAGE_NAME = "${env.IMAGE_NAME}-${env.IMAGE_TAG}.tgz";
+ 
+					echo "IMAGE_TAG ${env.IMAGE_TAG}";
+					echo "PACKAGE_NAME ${env.PACKAGE_NAME}";
+					echo "VERSION ${env.VERSION}";
+				}
+			}
+		}
+ 
+		stage("Release Env") {
+			when {
+				expression {
+					isIntegrationBranch()
+				}
+			}
+ 
+			steps {
+				script {
+					env.IMAGE_TAG = generateUATVersion();
+					env.VERSION = env.IMAGE_TAG;
+					env.PACKAGE_NAME = "${env.IMAGE_NAME}-${env.IMAGE_TAG}.tgz";
+ 
+					echo "IMAGE_TAG ${env.IMAGE_TAG}";
+					echo "PACKAGE_NAME ${env.PACKAGE_NAME}";
+					echo "VERSION ${env.VERSION}";
+ 
+				}
+			}
+		}
+ 
+        stage("Automation Build Env") {
+            when {
+                expression {
+                    isPromotionBranch()
+                }
+            }
+ 
+            steps {
+                script {
+                    env.IMAGE_TAG = generateUATPromotionVersion();
+                    env.VERSION = env.IMAGE_TAG;
+                    env.PACKAGE_NAME = "${env.IMAGE_NAME}-${env.IMAGE_TAG}.tgz";
+ 
+                    echo "IMAGE_TAG ${env.IMAGE_TAG}";
+                    echo "PACKAGE_NAME ${env.PACKAGE_NAME}";
+                    echo "VERSION ${env.VERSION}";
+ 
+                }
+            }
+        }
+ 
+		stage("Development Tasks") {
+			when {
+				expression {
+					isDevelopmentBranch()
+				}
+			}
+            steps {
+				container('ci') {
+					withGitKey(env.GIT_SECRET) {
+						script {
+                            cleanUpRepo();
+						}
+						buildFeatureBranch()
+					}
+				}
+            }
+        }
+ 
+		stage("Build Release") {
+			when {
+				expression {
+					isIntegrationBranch() || isPromotionBranch()
+				}
+			}
+			steps {
+				container('ci') {
+					withGitKey(env.GIT_SECRET) {
+						script {
+                            cleanUpRepo();
+						}
+						buildForRelease()
+					}
+				}
+			}
+		}
+		stage("Packaging for INT") {
+ 
+            steps {
+				dir('repo') {
+					container('oc-tools') {
+						withCredentials([
+								usernamePassword(
+										credentialsId: "${env.ARTIFACTORY_SECRET}",
+										usernameVariable: "USERNAME",
+										passwordVariable: "PASSWORD")]) {
+							sh label: "Create chart ", script: "helm package ${env.IMAGE_NAME}"
+ 
+						}
+					}
+				}
+			}
+        }
+ 
+		stage("Deploy Chart to INT") {
+ 
+			steps {
+				dir('repo') {
+					container('oc-tools') {
+						script {
+							loginToOpenShiftInt {
+								try {
+ 
+									sh "helm upgrade '${env.IMAGE_NAME}' --install --namespace ${env.INT_OC_NAMESPACE} ${env.PACKAGE_NAME}";
+									// deploy()
+ 
+								}
+								catch (Throwable e) {
+									echo "Caught ${e.toString()}";
+ 
+									deleteOldObjects();
+ 
+									sh "helm upgrade '${env.IMAGE_NAME}' --install --namespace ${env.INT_OC_NAMESPACE} ${env.PACKAGE_NAME}";
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+ 
+		stage("Image Promotion and Chart Copy") {
+			when {
+				expression {
+					((isIntegrationBranch() || isPromotionBranch()) && !ENV_PROMOTION_TO.equals("none"))
+				}
+			}
+			steps {
+				dir('helm') {
+					container('oc-tools') {
+						withCredentials([
+								usernamePassword(
+										credentialsId: "${env.ARTIFACTORY_SECRET}",
+										usernameVariable: "USERNAME",
+										passwordVariable: "PASSWORD")]) {
+ 
+							script {
+ 
+								ENV_PROMOTION_PATH = "${ENV_FROM_PROMOTION}-${ENV_PROMOTION_TO}";
+ 
+								echo "Promotion Path is ${ENV_PROMOTION_PATH}";
+ 
+								echo "Promoting image to higher env ...";
+ 
+									withEnv(['https_proxy=dev-net-proxy.intranet.db.com:8080']) {
+										promoteImage(
+												dapKeyId: env.DAP_SECRET,
+												project: env.OC_PROJECT,
+												promotionPath: ENV_PROMOTION_PATH,
+												imageName: env.IMAGE_NAME,
+												imageTag: env.IMAGE_TAG
+										)
+									}
+ 
+								PROMOTION_FOLDER = "${ENV_PROMOTION_TO}-${env.IMAGE_NAME}-${env.IMAGE_TAG}";
+ 
+								echo "Updated environment promotion folder :  ${PROMOTION_FOLDER}"
+ 
+								TARGET_ENV = "${ENV_PROMOTION_TO}";
+ 
+								echo "Target Env :  ${TARGET_ENV}"
+ 
+								ENV_PACKAGE_NAME = "${ENV_PROMOTION_TO}-${env.IMAGE_NAME}";
+ 
+								echo "Env package name :  ${ENV_PACKAGE_NAME}"
+ 
+								sh label: "List directories", script: "ls -lart"
+								sh label: "Copy Values.yml ", script: "cp values.yaml values_package.yaml"
+								sh label: "Remove Values.yml ", script: "rm -rf values.yaml"
+								sh label: "Delete build template dir ", script: "rm -rf build-template"
+								updateYaml(yamlFile: "Chart.yaml", params: ["version": env.IMAGE_TAG])
+								updateYaml(yamlFile: "Chart.yaml", params: ["name": env.IMAGE_NAME])
+ 
+								String valuesYamlPath = "values_package.yaml"
+								yaml = readYaml file: valuesYamlPath
+								yaml.originalValuesYaml = valuesYamlPath
+ 
+								yaml.image.name = "${env.IMAGE_NAME}"
+								yaml.image.tag = "${env.IMAGE_TAG}"
+								yaml.environment = "${SECRET_PREFIX}"
+								writeYaml file: "values.yaml", data: yaml
+ 
+								sh label: "Delete INT repo folder", script: "rm -rf ../repo"
+ 
+									sh label: "Create promotion folder", script: "mkdir ../repo"
+ 
+								sh label: "Create promotion folder", script: "mkdir ../repo/${PROMOTION_FOLDER}"
+ 
+								sh label: "Copy Helm Charts", script: "cp -vR config templates .helmignore Chart.yaml values.yaml ../repo/${PROMOTION_FOLDER}/"
+ 
+							}
+						}
+					}
+				}
+			}
+		}
+ 
+		stage("Helm Packaging (Higher Env)") {
+            when {
+				expression {
+					((isIntegrationBranch() || isPromotionBranch()) && !ENV_PROMOTION_TO.equals("none"))
+				}
+			}
+			steps {
+				dir('repo') {
+					container('oc-tools') {
+						withCredentials([
+								usernamePassword(
+										credentialsId: "${env.ARTIFACTORY_SECRET}",
+										usernameVariable: "USERNAME",
+										passwordVariable: "PASSWORD")]) {
+ 
+							script {
+ 
+								echo "environment promotion folder :  ${PROMOTION_FOLDER}"
+ 
+								sh label: "List directories", script: "ls -lart"
+ 
+								sh label: "Create UAT chart ", script: "helm package ${PROMOTION_FOLDER}"
+ 
+								sh label: "Push Helm chart to Artifactory", script: "curl -H 'X-JFrog-Art-Api:${PASSWORD}' -T ${env.PACKAGE_NAME}  ${env.HELM_VIRTUAL_URL}/${env.HELM_NAMESPACE}/${TARGET_ENV}/${env.PACKAGE_NAME}"
+							}
+						}
+					}
+				}
+			}
+		}
+ 
+		stage("Helm Promotion") {
+			when {
+				expression {
+					((isIntegrationBranch() || isPromotionBranch()) && !ENV_PROMOTION_TO.equals("none"))
+				}
+			}
+			steps {
+				dir('helm') {
+					container('oc-tools') {
+						withCredentials([
+								usernamePassword(
+										credentialsId: "${env.ARTIFACTORY_SECRET}",
+										usernameVariable: "USERNAME",
+										passwordVariable: "PASSWORD")]) {
+ 
+							script {
+ 
+								echo "Running Helm Promotion for ::::  ${ENV_PROMOTION_PATH}";
+ 
+								def HELM_VIRTUAL_URL_DOWNLOAD = "https://artifactory.intranet.db.com/artifactory/api/helm/hlm-all";
+								def ARGS = "${env.HELM_ARGS} ${ENV_PROMOTION_TO_NAMESPACE} + ${HELM_VIRTUAL_URL_DOWNLOAD}/${env.HELM_NAMESPACE}/${TARGET_ENV}/${env.PACKAGE_NAME}";
+ 
+								try {
+ 
+									helmDapActionFunc(ENV_PROMOTION_TO, ENV_PROMOTION_PATH, env.HELM_ACTION, ARGS);
+ 
+								} catch (Throwable e) {
+									echo "Caught error ${e.toString()}";
+									echo "Deleting existing helm release";
+ 
+									helmDapActionFunc(ENV_PROMOTION_TO, ENV_PROMOTION_PATH, "delete", env.IMAGE_NAME);
+ 
+									helmDapActionFunc(ENV_PROMOTION_TO, ENV_PROMOTION_PATH, env.HELM_ACTION, ARGS);
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+def deploy() {
+
+	withCredentials([
+
+			usernamePassword(
+
+					credentialsId: "${env.ARTIFACTORY_SECRET}",
+
+					usernameVariable: "USERNAME",
+
+					passwordVariable: "PASSWORD")]) {
+
+		sh "helm repo add hlm-all ${env.HELM_VIRTUAL_URL} --username ${USERNAME} --password ${PASSWORD}"
+
+		sh "helm repo update"
+
+		sh "helm upgrade '${env.IMAGE_NAME}' --install --username ${USERNAME} --namespace ${env.INT_OC_NAMESPACE} \
+
+               --password ${PASSWORD} \
+
+					${env.HELM_VIRTUAL_URL}/${env.HELM_NAMESPACE}/${env.PACKAGE_NAME} "
+
+	}
+
+}
+def deleteOldObjects() {
+	echo "Deleting existing objects in fabric";
+ 
+	try {
+		sh label: "deleting deployment", script: "oc delete deployment ${env.IMAGE_NAME}";
+	} catch (Throwable error) {
+		echo "Caught ${error.toString()}";
+		echo "deployment object ${env.IMAGE_NAME} doesn't exist.";
+	}
+ 
+	try {
+		sh label: "deleting service", script: "oc delete service ${IMAGE_NAME}";
+	} catch (Throwable error) {
+		echo "Caught ${error.toString()}";
+		echo "service object ${env.IMAGE_NAME} doesn't exist.";
+	}
+ 
+	try {
+		sh label: "deleting route", script: "oc delete route ${IMAGE_NAME}";
+	} catch (Throwable error) {
+		echo "Caught ${error.toString()}";
+		echo "route object ${env.IMAGE_NAME} doesn't exist.";
+	}
+ 
+	try {
+		sh label: "deleting javaargs", script: "oc delete configmap ${IMAGE_NAME}-javaargs";
+	} catch (Throwable error) {
+		echo "Caught ${error.toString()}";
+		echo "javaargs configmap object ${env.IMAGE_NAME}-javaargs doesn't exist.";
+	}
+ 
+	try {
+		sh label: "deleting configmaps", script: "oc delete configmap ${IMAGE_NAME}-config";
+	} catch (Throwable error) {
+		echo "Caught ${error.toString()}";
+		echo "javaargs configmap object ${env.IMAGE_NAME}-config doesn't exist.";
+	}
+ 
+	try {
+		sh label: "deleting secrets", script: "oc delete secret ${IMAGE_NAME}-secret";
+	} catch (Throwable error) {
+		echo "Caught ${error.toString()}";
+		echo "secrets object ${env.IMAGE_NAME}-secret doesn't exist.";
+	}
+}
+ 
+def helmDapActionFunc(promotion_to, promotion_path, action, args) {
+
+	withEnv(['https_proxy=dev-net-proxy.intranet.db.com:8080']) {
+
+		helmDapAction(
+
+				dapKeyId: env.DAP_SECRET,
+
+				project: env.OC_PROJECT,
+
+				targetEnv: promotion_to,
+
+				promotionPath: promotion_path,
+
+				helmAction: action,
+
+				helmArguments: args
+
+		)
+
+	}
+
+}
+ 
+def loginToOpenShiftInt(Closure func) {
+
+    ocDockerLogin(clusterUrl: env.INT_CLUSTER_URL, token: env.INT_OC_TOKEN_SECRET)
+
+	func()
+
+}
+ 
+def buildFeatureBranch() {
+
+    withCredentials([
+
+            usernamePassword(
+
+                    credentialsId: "${env.ARTIFACTORY_SECRET}",
+
+					usernameVariable: 'USERNAME',
+
+					passwordVariable: 'PASSWORD'),
+
+			string(
+
+					credentialsId: 'docker-token',
+
+					variable: 'DOCKER_TOKEN'
+
+            )]) {
+ 
+			configFileProvider(
+
+					[configFile(fileId: "$MVN_SETTINGS", variable: 'MAVEN_SETTINGS')]) {
+ 
+				sh "java -version"
+
+				sh label: "Set mvnw executable", script: "chmod +x ${pwd()}/mvnw"
+
+				sh "${pwd()}/mvnw clean install deploy jib:build -B \
+
+							 --global-settings $MAVEN_SETTINGS \
+
+							 --settings $MAVEN_SETTINGS \
+
+							 -Dmaven.test.skip=true \
+
+							 -Dnamespace=${env.INT_OC_NAMESPACE} \
+
+							 -Dbuild.imageTag=1.0.0 \
+
+							 -Dbuild.imageName=${env.IMAGE_NAME} \
+
+							 -DchartVersion=${env.IMAGE_TAG} \
+
+							 -Dbuild.GROUP_ID=${env.GROUP_ID} \
+
+							 -Dbuild.ARTIFACT_ID=${env.ARTIFACT_ID} \
+
+							 -Dbuild.VERSION=${env.VERSION} \
+
+							 -Dbuild.SNAPSHOT_VERSION=${env.SNAPSHOT_VERSION} \
+
+							 -Dproject.version=${env.VERSION} \
+
+                      -Dbuild.env=int"
+
+//                      -Dbuild.REPO_NAME=mvn-snapshot-local"
+
+			}
+
+    }
+
+}
+ 
+def buildForRelease() {
+
+	withCredentials([
+
+			usernamePassword(
+
+					credentialsId: "${env.ARTIFACTORY_SECRET}",
+
+					usernameVariable: 'USERNAME',
+
+					passwordVariable: 'PASSWORD'),
+
+			string(
+
+					credentialsId: 'docker-token',
+
+					variable: 'DOCKER_TOKEN'
+
+			)]) {
+ 
+		configFileProvider(
+
+				[configFile(fileId: "$MVN_SETTINGS", variable: 'MAVEN_SETTINGS')]) {
+ 
+			sh label: "Set mvnw executable", script: "chmod +x ${pwd()}/mvnw"
+
+			sh "${pwd()}/mvnw clean install deploy jib:build -B \
+
+							 --global-settings $MAVEN_SETTINGS \
+
+							 --settings $MAVEN_SETTINGS \
+
+							 -Dmaven.test.skip=true \
+
+							 -Dnamespace=${env.INT_OC_NAMESPACE} \
+
+							 -Dbuild.imageTag=${env.IMAGE_TAG} \
+
+							 -Dbuild.imageName=${env.IMAGE_NAME} \
+
+							 -DchartVersion=${env.IMAGE_TAG} \
+
+							 -Dbuild.GROUP_ID=${env.GROUP_ID} \
+
+							 -Dbuild.ARTIFACT_ID=${env.ARTIFACT_ID} \
+
+							 -Dbuild.VERSION=${env.IMAGE_TAG} \
+
+                      -Dproject.version=${env.IMAGE_TAG} \
+
+							 -Dbuild.env=int \
+
+                      -Dbuild.REPO_NAME=mvn-public-local\
+
+                      -Dbuild.SNAPSHOT_VERSION=${env.BLANK}"
+
+		}
+
+	}
+
+}
+ 
+def cleanUpRepo() {
+
+    sh '''
+
+        USED_SPACE=$(df -h | grep /home/raduser/.m2 | awk '{print $4}' | sed 's/%//g')
+
+        REQUIRED_SPACE=80
+
+        echo "USED space : " $USED_SPACE
+
+        echo "Required space : " $REQUIRED_SPACE
+
+        if [ $USED_SPACE -lt $REQUIRED_SPACE  ]; then
+
+        echo "Space is available";
+
+        else
+
+        rm -rf /home/raduser/.m2/repository/com/db/cis/*;
+
+        echo "Space is not available. Removing old jars from /home/raduser/.m2/repository/com/db/cis/.";
+
+        fi
+
+    '''
+
+}
+ 
+ 
+/*
+
+Input = TCV_M5_2021, TCV_M7_CICD_2022
+
+Output = 2021.M5.BUILD_NUMBER, 2022.M7.BUILD_NUMBER
+
+*/
+
+def generateUATVersion() {
+
+	String[] branchStr = env.BRANCH_NAME.toString()
+
+			.replaceAll("[^A-Za-z0-9]", "_")
+
+			.replaceAll("-+", "_")
+
+			.replaceAll("-", "_")
+
+			.split("_");
+ 
+	String year = '2022';
+
+	String month = '00';
+
+	if (branchStr.size()>2) {
+
+		year = branchStr[branchStr.size() - 1];
+
+		month = branchStr[1];
+
+	}
+
+	return "${year}.${month}.${env.BUILD_NUMBER}" as String;
+
+}
+ 
+/*
+
+Input = master
+
+Output = 1.0.BUILD_NUMBER
+
+*/
+
+def generateUATPromotionVersion() {
+
+	return "1.0.${env.BUILD_NUMBER}" as String;
+
+}
+ 
+/*
+
+Input = feature/TFCORE-12564-routing
+
+Output = 2021.12564.BUILD_NUMBER
+
+*/
+
+def generateDevVersion() {
+
+	String[] branchStr = env.BRANCH_NAME.toString()
+
+			.replaceAll("[^A-Za-z0-9]", "_")
+
+			.replaceAll("-+", "_")
+
+			.replaceAll("-", "_")
+
+			.split("_");
+ 
+	int year = Calendar.getInstance().get(Calendar.YEAR);
+
+	String ticket ="ticket";
+ 
+	if (branchStr.size()>3) {
+
+		ticket = branchStr[2];
+
+	}
+ 
+	return "${year}.${ticket}.${env.BUILD_NUMBER}" as String;
+
+}
+ 
+def isDevelopmentBranch() {
+
+	echo "Branch is >> ${env.BRANCH_NAME}";
+
+	//env.BRANCH_NAME ==~ 'feature/.*'
+
+	env.BRANCH_NAME ==~ 'development.*'
+
+}
+ 
+ 
+def isIntegrationBranch() {
+
+	// env.BRANCH_NAME ==~ 'feature.*'
+
+	//env.BRANCH_NAME ==~ 'TCV_M.*'
+
+	env.BRANCH_NAME ==~ env.BRANCH_NAME
+
+}
+ 
+ 
+def isPromotionBranch() {
+
+	env.BRANCH_NAME ==~ 'master'
+
+}
+// -i entity-service --namespace dk2042-f   https://artifactory.intranet.db.com/artifactory/hlm-all/com/db/cis/ltuat/entity-service-0.0.1.50.tgz
